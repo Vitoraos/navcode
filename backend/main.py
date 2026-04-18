@@ -21,9 +21,6 @@ import asyncio
 import os
 import uvicorn
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -270,3 +267,12 @@ def health():
         "primary_model": PRIMARY_MODEL,
         "fallback_model": FALLBACK_MODEL
     }
+import os
+import uvicorn
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 10000))
+    )
