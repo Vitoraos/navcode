@@ -15,6 +15,8 @@ Flow:
 import os, json, base64
 from pathlib import Path
 from typing import AsyncGenerator, List
+from typing import List, Optional
+import asyncio
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -61,8 +63,7 @@ class ChatRequest(BaseModel):
     repo: str
     branch: str = "main"
     skill_md: str = ""
-    selected_files: List[str] = []   # 🔥 KEY CHANGE
-
+    selected_files: Optional[List[str]] = [] # 🔥 Fix 422 mismatch
 
 # ── System Prompt ─────────────────────────────────────────────
 SYSTEM_TEMPLATE = """
@@ -90,33 +91,63 @@ Do not assume existence of any other files.
 
 
 # ── GitHub file fetcher (selected only) ───────────────────────
-async def fetch_selected_files(repo: str, branch: str, pat: str, files: List[str]) -> str:
+async def fetch_single_file(client, headers, repo, branch, path):
+    cr = await client.get(
+        f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}",
+        headers=headers
+    )
+    if cr.status_code != 200:
+        return None
+    content = cr.json().get("content", "")
+    if not content: return None
+    return base64.b64decode(content).decode("utf-8", errors="ignore")
+
+async def fetch_repo(repo: str, branch: str, pat: str) -> str:
     headers = {
         "Authorization": f"Bearer {pat}",
         "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
     }
-
     async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1",
+            headers=headers
+        )
+        if r.status_code != 200:
+            raise HTTPException(r.status_code, r.json().get("message", "GitHub API error"))
+            
+        tree = r.json().get("tree", [])
+        valid_paths = []
+        for item in tree:
+            if item["type"] != "blob": continue
+            path = item["path"]
+            if any(skip in path.split("/") for skip in SKIP_DIRS): continue
+            if Path(path).suffix not in INCLUDE_EXT and Path(path).name != ".env.example": continue
+            if path.endswith(("package-lock.json","yarn.lock","pnpm-lock.yaml")): continue
+            valid_paths.append(path)
+
+        # Concurrency limiter (10 at a time)
+        sem = asyncio.Semaphore(10)
+        async def fetch_with_limit(p):
+            async with sem:
+                return await fetch_single_file(client, headers, repo, branch, p)
+                
+        tasks = [fetch_with_limit(p) for p in valid_paths[:50]] # Cap at 50 files to stay under context limit
+        results = await asyncio.gather(*tasks)
+
         parts = []
-
-        for path in files:
-            r = await client.get(
-                f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}",
-                headers=headers
-            )
-
-            if r.status_code != 200:
-                continue
-
-            content = r.json().get("content", "")
-            raw = base64.b64decode(content).decode("utf-8", errors="ignore")
-
+        total = 0
+        for path, raw in zip(valid_paths[:50], results):
+            if raw is None: continue
             if len(raw) > MAX_FILE_CHARS:
-                raw = raw[:MAX_FILE_CHARS] + "\n... [truncated]"
-
+                raw = raw[:MAX_FILE_CHARS] + f"\n... [truncated at {MAX_FILE_CHARS} chars]"
+            if total + len(raw) > MAX_TOTAL_CHARS:
+                parts.append(f"### FILE: {path}\n[omitted — context limit reached]\n")
+                break
             parts.append(f"### FILE: {path}\n```\n{raw}\n```")
+            total += len(raw)
 
-        return "\n\n".join(parts) if parts else "[No files selected]"
+        return "\n".join(parts) if parts else "[No supported files found]"
 
 
 # ── Supabase memory ───────────────────────────────────────────
