@@ -14,36 +14,37 @@ export async function sendChatRequest(payload: ChatRequest) {
 export async function streamChatResponse(
   response: Response,
   onToken: (text: string) => void,
-  onDone: () => void
+  onDone: () => void,
+  onError: (err: string) => void
 ) {
   const reader = response.body?.getReader();
   const decoder = new TextDecoder();
-
   if (!reader) return;
 
+  let buffer = "";
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
+    buffer += decoder.decode(value, { stream: true });
 
-    const chunk = decoder.decode(value);
-    const lines = chunk.split("\n");
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
 
     for (const line of lines) {
-      if (!line.startsWith("data:")) continue;
-
-      const data = line.replace("data:", "").trim();
-
-      if (data === "[DONE]") {
+      if (!line.startsWith("data: ")) continue;
+      const payload = line.slice(6).trim();
+      if (payload === "[DONE]") {
         onDone();
         return;
       }
-
       try {
-        const parsed = JSON.parse(data);
+        const parsed = JSON.parse(payload);
         if (parsed.text) onToken(parsed.text);
-      } catch }
+        if (parsed.error) onError(parsed.error);
+      } catch (e) {
+        console.warn("SSE parse error:", e);
+      }
     }
   }
-
   onDone();
 }
