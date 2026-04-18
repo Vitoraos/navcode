@@ -1,28 +1,12 @@
-"""
-NavGuard AI Coding Agent — Backend (File-Scoped Version)
-========================================================
-Now supports explicit file selection instead of full repo ingestion.
-
-Flow:
-  1. Receive prompt + PAT + repo + branch + skill_md + selected_files + session_id
-  2. Fetch ONLY selected GitHub files
-  3. Pull last 10 messages from Supabase
-  4. Merge into system prompt
-  5. Stream LLM response
-  6. Save conversation to Supabase
-"""
-
-import os, json, base64
-from pathlib import Path
-from typing import AsyncGenerator, List
-from typing import List, Optional
-import asyncio
-
 import os
-import uvicorn
-
+import json
+import base64
+import asyncio
+from pathlib import Path
+from typing import AsyncGenerator, List, Optional
 
 import httpx
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -42,6 +26,10 @@ PRIMARY_MODEL  = os.getenv("PRIMARY_MODEL", "minimax/minimax-text-01")
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "openai/gpt-4-turbo")
 
 MAX_FILE_CHARS = 8000
+MAX_TOTAL_CHARS = 50000
+
+SKIP_DIRS = {".git", "node_modules", "__pycache__"}
+INCLUDE_EXT = {".ts", ".tsx", ".js", ".jsx", ".py", ".json", ".md"}
 
 # ── Clients ───────────────────────────────────────────────────
 llm = OpenAI(
@@ -49,9 +37,20 @@ llm = OpenAI(
     base_url="https://openrouter.ai/api/v1"
 )
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# ✅ Safe Supabase init
+supabase: Optional[Client] = None
+
+try:
+    if SUPABASE_URL and SUPABASE_KEY:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("Supabase connected")
+    else:
+        print("Supabase env missing")
+except Exception as e:
+    print("Supabase init failed:", e)
 
 app = FastAPI(title="NavGuard Agent (File Scoped)")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -67,7 +66,7 @@ class ChatRequest(BaseModel):
     repo: str
     branch: str = "main"
     skill_md: str = ""
-    selected_files: Optional[List[str]] = [] # 🔥 Fix 422 mismatch
+    selected_files: Optional[List[str]] = []
 
 # ── System Prompt ─────────────────────────────────────────────
 SYSTEM_TEMPLATE = """
@@ -93,8 +92,7 @@ Do not assume existence of any other files.
 {codebase}
 """
 
-
-# ── GitHub file fetcher (selected only) ───────────────────────
+# ── GitHub helpers ────────────────────────────────────────────
 async def fetch_single_file(client, headers, repo, branch, path):
     cr = await client.get(
         f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}",
@@ -103,59 +101,41 @@ async def fetch_single_file(client, headers, repo, branch, path):
     if cr.status_code != 200:
         return None
     content = cr.json().get("content", "")
-    if not content: return None
+    if not content:
+        return None
     return base64.b64decode(content).decode("utf-8", errors="ignore")
 
-async def fetch_repo(repo: str, branch: str, pat: str) -> str:
+async def fetch_selected_files(repo, branch, pat, selected_files):
     headers = {
         "Authorization": f"Bearer {pat}",
         "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
     }
+
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(
-            f"https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1",
-            headers=headers
-        )
-        if r.status_code != 200:
-            raise HTTPException(r.status_code, r.json().get("message", "GitHub API error"))
-            
-        tree = r.json().get("tree", [])
-        valid_paths = []
-        for item in tree:
-            if item["type"] != "blob": continue
-            path = item["path"]
-            if any(skip in path.split("/") for skip in SKIP_DIRS): continue
-            if Path(path).suffix not in INCLUDE_EXT and Path(path).name != ".env.example": continue
-            if path.endswith(("package-lock.json","yarn.lock","pnpm-lock.yaml")): continue
-            valid_paths.append(path)
-
-        # Concurrency limiter (10 at a time)
-        sem = asyncio.Semaphore(10)
-        async def fetch_with_limit(p):
-            async with sem:
-                return await fetch_single_file(client, headers, repo, branch, p)
-                
-        tasks = [fetch_with_limit(p) for p in valid_paths[:50]] # Cap at 50 files to stay under context limit
-        results = await asyncio.gather(*tasks)
-
         parts = []
         total = 0
-        for path, raw in zip(valid_paths[:50], results):
-            if raw is None: continue
+
+        for path in selected_files:
+            raw = await fetch_single_file(client, headers, repo, branch, path)
+            if not raw:
+                continue
+
             if len(raw) > MAX_FILE_CHARS:
-                raw = raw[:MAX_FILE_CHARS] + f"\n... [truncated at {MAX_FILE_CHARS} chars]"
+                raw = raw[:MAX_FILE_CHARS] + "\n... [truncated]"
+
             if total + len(raw) > MAX_TOTAL_CHARS:
-                parts.append(f"### FILE: {path}\n[omitted — context limit reached]\n")
                 break
+
             parts.append(f"### FILE: {path}\n```\n{raw}\n```")
             total += len(raw)
 
-        return "\n".join(parts) if parts else "[No supported files found]"
-
+        return "\n".join(parts) if parts else "[No files fetched]"
 
 # ── Supabase memory ───────────────────────────────────────────
 def get_history(session_id: str):
+    if not supabase:
+        return []
+
     res = (
         supabase.table("agent_messages")
         .select("role,content")
@@ -166,13 +146,14 @@ def get_history(session_id: str):
     )
     return list(reversed(res.data or []))
 
-
 def save_messages(session_id: str, user_msg: str, assistant_msg: str):
+    if not supabase:
+        return
+
     supabase.table("agent_messages").insert([
         {"session_id": session_id, "role": "user", "content": user_msg},
         {"session_id": session_id, "role": "assistant", "content": assistant_msg},
     ]).execute()
-
 
 # ── Chat endpoint ─────────────────────────────────────────────
 @app.post("/chat")
@@ -190,7 +171,6 @@ async def chat(req: ChatRequest):
     if not req.selected_files:
         raise HTTPException(400, "No files selected")
 
-    # 1. Fetch ONLY selected files
     codebase = await fetch_selected_files(
         req.repo,
         req.branch,
@@ -198,29 +178,22 @@ async def chat(req: ChatRequest):
         req.selected_files
     )
 
-    # 2. Load history
     history = get_history(req.session_id)
 
-    # 3. Build system prompt
     system = SYSTEM_TEMPLATE.format(
         skill_md=req.skill_md or "[No SKILL.md provided]",
         codebase=codebase
     )
 
     messages = [{"role": "system", "content": system}]
-
-    for m in history:
-        messages.append({"role": m["role"], "content": m["content"]})
-
+    messages += history
     messages.append({"role": "user", "content": req.prompt})
 
-    # 4. Stream response
     full_reply = []
 
     async def stream() -> AsyncGenerator[str, None]:
         for attempt, model in enumerate([PRIMARY_MODEL, FALLBACK_MODEL]):
             try:
-
                 response = llm.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -247,18 +220,18 @@ async def chat(req: ChatRequest):
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
-
 # ── Utilities ────────────────────────────────────────────────
 @app.get("/history/{session_id}")
 def history(session_id: str):
     return get_history(session_id)
 
-
 @app.delete("/history/{session_id}")
 def clear_history(session_id: str):
+    if not supabase:
+        return {"cleared": False}
+
     supabase.table("agent_messages").delete().eq("session_id", session_id).execute()
     return {"cleared": True}
-
 
 @app.get("/health")
 def health():
@@ -267,9 +240,8 @@ def health():
         "primary_model": PRIMARY_MODEL,
         "fallback_model": FALLBACK_MODEL
     }
-import os
-import uvicorn
 
+# ── Run ───────────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
