@@ -6,3 +6,4 @@ python-dotenv
 supabase
 openai
 pydantic<3
+supabase==2.3.4  # 🔥 MISSING BEFORE
