@@ -192,8 +192,11 @@ async def chat(req: ChatRequest):
     full_reply = []
 
     async def stream() -> AsyncGenerator[str, None]:
+        import traceback # 🔥 Added for deep debugging
+        
         for attempt, model in enumerate([PRIMARY_MODEL, FALLBACK_MODEL]):
             try:
+                print(f"🔄 Attempting OpenRouter call with model: {model}")
                 response = llm.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -209,16 +212,25 @@ async def chat(req: ChatRequest):
 
                 save_messages(req.session_id, req.prompt, "".join(full_reply))
                 yield "data: [DONE]\n\n"
+                print(f"✅ Successfully completed stream with {model}")
                 return
 
             except Exception as e:
+                print(f"❌ ERROR on attempt {attempt+1} ({model}):")
+                print(e) 
+                
                 if attempt == 0:
+                    print("⚠️ Falling back to secondary model...")
                     full_reply.clear()
                     continue
 
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-    return StreamingResponse(stream(), media_type="text/event-stream")
+                # Dump the deep traceback to your mobile terminal so you know EXACTLY what is crashing
+                print("\n🚨 CRITICAL OPENROUTER FAILURE TRACEBACK 🚨")
+                traceback.print_exc()
+                
+                # Send the error to the React frontend
+                error_msg = str(e).replace('"', "'") # Escape quotes so JSON dumping doesn't break
+                yield f"data: {json.dumps({'error': f'OpenRouter Failed: {error_msg}'})}\n\n"
 
 # ── Utilities ────────────────────────────────────────────────
 @app.get("/history/{session_id}")
