@@ -40,15 +40,6 @@ llm = OpenAI(
 # ✅ Safe Supabase init
 supabase: Optional[Client] = None
 
-try:
-    if SUPABASE_URL and SUPABASE_KEY:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("Supabase connected")
-    else:
-        print("Supabase env missing")
-except Exception as e:
-    print("Supabase init failed:", e)
-
 app = FastAPI(title="NavGuard Agent (File Scoped)")
 
 app.add_middleware(
